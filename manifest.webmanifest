@@ -1,0 +1,15 @@
+{
+  "name": "آنالیزگر فوتبال نسخه پیشرفته",
+  "short_name": "آنالیز فوتبال",
+  "description": "تحلیل چندعاملی فرم، قدرت حریفان، بازیکنان غایب، استراحت، جدول و احتمال نتیجه فوتبال",
+  "lang": "fa",
+  "dir": "rtl",
+  "start_url": "./index.html",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#0b1220",
+  "theme_color": "#101b2b",
+  "icons": [
+    {"src":"./icon.svg","sizes":"any","type":"image/svg+xml","purpose":"any maskable"}
+  ]
+}
