@@ -234,6 +234,139 @@ function statPanel(team,st,form){const name=esc(team.team.name),logo=team.team.l
 function matchesHtml(fixtures,team1,team2){if(!fixtures?.length)return '<div class="help">بازی ثبت‌شده‌ای در این بخش پیدا نشد.</div>';return fixtures.slice(0,10).map(f=>{const h=f.teams.home,a=f.teams.away;const sc=isDone(f)?`${f.goals.home} – ${f.goals.away}`:'در انتظار';return `<div class="match-item"><div><div>${esc(h.name)} – ${esc(a.name)}</div><div class="date">${fmtDate(f.fixture.date)} · ${esc(f.league?.name||'')}</div></div><div class="score">${sc}</div></div>`}).join('');}
 function h2hStats(fixtures,homeId){let w=0,d=0,l=0,gf=0,ga=0;const done=(fixtures||[]).filter(isDone);done.forEach(f=>{const h=f.teams.home.id===homeId;const x=num(h?f.goals.home:f.goals.away),y=num(h?f.goals.away:f.goals.home);gf+=x;ga+=y;if(x>y)w++;else if(x===y)d++;else l++;});return {n:done.length,w,d,l,gf,ga,gd:gf-ga,done};}
 function standingsRows(data,homeId,awayId){const groups=data?.response?.[0]?.league?.standings||[];const rows=groups.flat();return rows.filter(r=>r.team?.id===homeId||r.team?.id===awayId);}
+
+let allowedSeason=null;
+try{const v=parseInt(localStorage.getItem('fa_allowedSeason')||'');if(v>2000)allowedSeason=v;}catch(e){}
+function planSeasonRange(msg){const m=String(msg).match(/(20\d{2})\D{1,20}(20\d{2})/);return m?[Math.min(+m[1],+m[2]),Math.max(+m[1],+m[2])]:null;}
+async function seasonFixtures(teamId,season){
+  let s=season||allowedSeason||(new Date().getMonth()>=6?new Date().getFullYear():new Date().getFullYear()-1);
+  for(let i=0;i<3;i++){
+    try{
+      const r=await api('/fixtures',{team:teamId,season:s});
+      allowedSeason=s;try{localStorage.setItem('fa_allowedSeason',String(s));}catch(e){}
+      return {season:s,list:r.response||[]};
+    }catch(e){
+      const range=planSeasonRange(e.message);
+      if(range&&/plan|season/i.test(e.message)&&range[1]!==s){s=range[1];continue;}
+      throw e;
+    }
+  }
+  throw new Error('فصل مجاز برای پلن شما پیدا نشد.');
+}
+async function teamFixtures(teamId){
+  const a=await seasonFixtures(teamId);
+  let list=a.list;
+  if(list.filter(isDone).length<20){
+    try{const b=await seasonFixtures(teamId,a.season-1);list=list.concat(b.list);}catch(e){}
+  }
+  const done=list.filter(isDone).sort((x,y)=>new Date(y.fixture.date)-new Date(x.fixture.date)).slice(0,20);
+  const upcoming=list.filter(f=>!isDone(f)&&!['PST','CANC','ABD','AWD','WO'].includes(f.fixture?.status?.short)).sort((x,y)=>new Date(x.fixture.date)-new Date(y.fixture.date));
+  return {done,upcoming,season:a.season};
+}
+async function headToHead(hId,aId){
+  const r=await api('/fixtures/headtohead',{h2h:`${hId}-${aId}`});
+  return (r.response||[]).sort((x,y)=>new Date(y.fixture.date)-new Date(x.fixture.date)).slice(0,10);
+}
+async function analyze(){
+ if(!selectedHome||!selectedAway){setStatus('ابتدا جست‌وجوی دو تیم را انجام بده.','error');return;}
+ $('analyzeBtn').disabled=true;$('report').classList.add('hidden');setStatus('در حال دریافت فرم، قدرت حریفان، آمار فصل، غایبان و وضعیت مسابقه...','busy');callCount=0;quotaRemaining=null;quotaLimit=null;
+ try{
+  const hId=selectedHome.team.id,aId=selectedAway.team.id;
+  const [hData,aData,h2h]=await Promise.all([teamFixtures(hId),teamFixtures(aId),headToHead(hId,aId).catch(()=>[])]);
+  const hFixtures=hData.done,aFixtures=aData.done;
+  const upcomingAll=[...hData.upcoming,...aData.upcoming];
+  let match=upcomingAll.filter(f=>[f.teams?.home?.id,f.teams?.away?.id].includes(hId)&&[f.teams?.home?.id,f.teams?.away?.id].includes(aId)).sort((x,y)=>new Date(x.fixture.date)-new Date(y.fixture.date))[0]||null;
+  if(!hFixtures.length&&!aFixtures.length)throw new Error('بازی ثبت‌شده‌ای برای این دو تیم در فصل‌های مجاز پلن تو پیدا نشد.');
+  if(allowedSeason&&allowedSeason<(new Date().getMonth()>=6?new Date().getFullYear():new Date().getFullYear()-1))setStatus('پلن رایگان فقط به داده‌ی فصل '+allowedSeason+' و قبل‌تر دسترسی دارد؛ تحلیل بر اساس همان فصل است.','busy');
+  const hs=statsFor(hId,hFixtures),as=statsFor(aId,aFixtures),hf=recentForm(hId,hFixtures),af=recentForm(aId,aFixtures);
+  let modelHome=selectedHome,modelAway=selectedAway,modelHs=hs,modelAs=as,modelHomeId=hId,modelAwayId=aId,homeFixtures=hFixtures,awayFixtures=aFixtures;
+  if(match&&match.teams.home.id===aId){modelHome=selectedAway;modelAway=selectedHome;modelHs=as;modelAs=hs;modelHomeId=aId;modelAwayId=hId;homeFixtures=aFixtures;awayFixtures=hFixtures;}
+  const hLeague=primaryLeagueInfo(hFixtures),aLeague=primaryLeagueInfo(aFixtures);
+  let homeSeasonRaw=null,awaySeasonRaw=null,homePlayersRaw=null,awayPlayersRaw=null,homeMainStandings=null,awayMainStandings=null;
+  const requests=[];
+  if(hLeague){requests.push(api('/teams/statistics',{league:hLeague.league,season:hLeague.season,team:hId}).then(x=>homeSeasonRaw=x).catch(()=>null),api('/players',{team:hId,league:hLeague.league,season:hLeague.season}).then(x=>homePlayersRaw=x).catch(()=>null));}
+  if(aLeague){requests.push(api('/teams/statistics',{league:aLeague.league,season:aLeague.season,team:aId}).then(x=>awaySeasonRaw=x).catch(()=>null),api('/players',{team:aId,league:aLeague.league,season:aLeague.season}).then(x=>awayPlayersRaw=x).catch(()=>null));}
+  const leagueKeys=new Set();
+  for(const [info,side] of [[hLeague,'h'],[aLeague,'a']]){if(info){const key=info.league+'-'+info.season;if(!leagueKeys.has(key)){leagueKeys.add(key);requests.push(api('/standings',{league:info.league,season:info.season}).then(x=>{if(side==='h')homeMainStandings=x;else awayMainStandings=x;if(hLeague&&aLeague&&hLeague.league===aLeague.league){homeMainStandings=x;awayMainStandings=x;}}).catch(()=>null));}}}
+  let injuries=null,providerPred=null,standings=null,lineups=null,oddsRaw=null;
+  if(match){const fId=match.fixture.id;requests.push(api('/injuries',{fixture:fId}).then(x=>injuries=x.response||[]).catch(()=>null),api('/predictions',{fixture:fId}).then(x=>providerPred=x.response?.[0]||null).catch(()=>null),api('/odds',{fixture:fId}).then(x=>oddsRaw=x).catch(()=>null),api('/standings',{league:match.league.id,season:match.league.season}).then(x=>standings=x).catch(()=>null));const kick=new Date(match.fixture.date).getTime(),now=Date.now();if(kick-now<4*60*60*1000&&kick-now>-2*60*60*1000)requests.push(api('/fixtures/lineups',{fixture:fId}).then(x=>lineups=x.response||[]).catch(()=>null));}
+  await Promise.all(requests);
+  const homeTable=homeMainStandings||standings,awayTable=awayMainStandings||standings;
+  const homeTableMap=standingsMap(homeTable),awayTableMap=standingsMap(awayTable);
+  const homeAbsence=absenceImpact(injuries,modelHomeId,modelHomeId===hId?homePlayersRaw:awayPlayersRaw);
+  const awayAbsence=absenceImpact(injuries,modelAwayId,modelAwayId===aId?awayPlayersRaw:homePlayersRaw);
+  const kickoff=match?.fixture?.date||null;
+  const homeRest=restAndCongestion(modelHomeId,modelHomeId===hId?hFixtures:aFixtures,kickoff),awayRest=restAndCongestion(modelAwayId,modelAwayId===aId?aFixtures:hFixtures,kickoff);
+  const homeQuality=weightedRecent(modelHomeId,modelHomeId===hId?hFixtures:aFixtures,homeTableMap),awayQuality=weightedRecent(modelAwayId,modelAwayId===aId?aFixtures:hFixtures,awayTableMap);
+  const homeSeason=teamSeasonRates(modelHomeId===hId?homeSeasonRaw:awaySeasonRaw),awaySeason=teamSeasonRates(modelAwayId===aId?awaySeasonRaw:homeSeasonRaw);
+  const market=marketProbabilities(oddsRaw,match);
+  const pred=estimateAdvanced({homeStats:modelHs,awayStats:modelAs,homeTeamId:modelHomeId,awayTeamId:modelAwayId,homeFixtures:modelHomeId===hId?hFixtures:aFixtures,awayFixtures:modelAwayId===aId?aFixtures:hFixtures,h2h,homeSeason,awaySeason,homeAbsence,awayAbsence,homeRest,awayRest,homeQuality,awayQuality,provider:providerPred,market,fixture:match});
+  renderReport({selectedHome,selectedAway,hs,as,hf,af,h2h,pred,match,injuries,providerPred,standings,lineups,modelHome,modelAway,modelHomeId,modelAwayId,homeSeason,awaySeason,homeQuality,awayQuality,homeRest,awayRest,homeAbsence,awayAbsence,homeLeague:modelHomeId===hId?hLeague:aLeague,awayLeague:modelAwayId===aId?aLeague:hLeague,homeTable,awayTable,market});
+  setStatus('تحلیل پیشرفته آماده شد. کیفیت و کمبود داده‌ها در گزارش مشخص شده است.');
+ }catch(e){setStatus(esc(e.message),'error');}
+ finally{$('analyzeBtn').disabled=false;}
+}
+function renderReport(d){
+ const {selectedHome:H,selectedAway:A,hs,as,hf,af,h2h,pred,match,injuries,providerPred,standings,lineups,modelHome,modelAway,modelHomeId,modelAwayId,homeSeason,awaySeason,homeQuality,awayQuality,homeRest,awayRest,homeAbsence,awayAbsence,homeLeague,awayLeague,homeTable,awayTable,market}=d;
+ const f=match?getFixtureBits(match):null;$('report').classList.remove('hidden');
+ $('matchHeader').innerHTML=`<div class="match-team"><img src="${esc(H.team.logo||'')}" alt=""><div><b>${esc(H.team.name)}</b><div class="team-meta">تیم انتخابی اول</div></div></div><div class="vs">${match?'VS':'مقایسه'}</div><div class="match-team away"><div><b>${esc(A.team.name)}</b><div class="team-meta">تیم انتخابی دوم</div></div><img src="${esc(A.team.logo||'')}" alt=""></div>`;
+ $('fixtureBadge').textContent=match?(f.status==='NS'?'مسابقه آینده':(['1H','2H','HT','ET','P','LIVE'].includes(f.status)?'مسابقه زنده':'مسابقه شناسایی شد')):'بازی مستقیم آینده پیدا نشد';
+ $('fixtureDetails').textContent=match?`${f.league||'رقابت نامشخص'} · ${fmtDate(f.date)} · فصل ${f.season||'—'} · میزبان واقعی: ${esc(f.home?.name||'—')}${match.teams.home.id!==H.team.id?' · ترتیب دو تیم با ورودی شما متفاوت است':''}`:'بازی آینده مستقیم بین دو تیم در برنامه نزدیک پیدا نشد؛ درصدها مقایسه آماری با فرض تیم اول به‌عنوان میزبان هستند.';
+ const homeLabel=match?`برد ${esc(modelHome.team.name)}`:`برد ${esc(H.team.name)}`,awayLabel=match?`برد ${esc(modelAway.team.name)}`:`برد ${esc(A.team.name)}`;
+ const prob=[{label:homeLabel,p:pred.home,cls:'homebar'},{label:'مساوی',p:pred.draw,cls:'drawbar'},{label:awayLabel,p:pred.away,cls:'awaybar'}];
+ $('probabilities').innerHTML=prob.map(x=>`<div class="prob-row"><b>${x.label}</b><div class="bar"><i class="${x.cls}" style="width:${Math.round(x.p*100)}%"></i></div><strong>${pct(x.p)}</strong></div>`).join('');
+ $('modelMetrics').innerHTML=`<div class="metric"><b>${pred.lambdaHome.toFixed(2)}</b><span>گل مورد انتظار ${esc(modelHome.team.name)}</span></div><div class="metric"><b>${pred.lambdaAway.toFixed(2)}</b><span>گل مورد انتظار ${esc(modelAway.team.name)}</span></div><div class="metric"><b>${pred.score.map(s=>s.i+'–'+s.j).join(' / ')}</b><span>نتایج محتمل مدل</span></div>`;
+ if(providerPred?.predictions?.percent){const pp=providerPred.predictions.percent;$('providerPrediction').classList.remove('hidden');$('providerPrediction').innerHTML=`<b>مدل پیش‌بینی API-Football:</b> میزبان ${esc(pp.home||'—')} · مساوی ${esc(pp.draw||'—')} · مهمان ${esc(pp.away||'—')}<br><span class="help">این خروجی جدا از مدل داخلی اپ نشان داده شده و فقط در صورت وجود داده در سرویس در دسترس است.</span>`;}else $('providerPrediction').classList.add('hidden');
+ $('teamStats').innerHTML=statPanel(H,hs,hf)+statPanel(A,as,af);
+ const hh=h2hStats(h2h,H.team.id);$('h2hCount').textContent=`${hh.n} بازی کامل`;$('h2hSummary').innerHTML=[['برد تیم اول',hh.w],['مساوی',hh.d],['برد تیم دوم',hh.l],['گل تیم اول',hh.gf],['گل تیم دوم',hh.ga],['تفاضل گل',hh.gd>0?'+'+hh.gd:hh.gd]].map(x=>`<div class="metric"><b>${x[1]}</b><span>${x[0]}</span></div>`).join('');$('h2hMatches').innerHTML=matchesHtml(hh.done,H,A);
+ let table='';if(standings){const rows=standingsRows(standings,H.team.id,A.team.id);if(rows.length){table='<h3 style="font-size:13px">جایگاه در جدول رقابت این مسابقه</h3><div class="tablewrap"><table><thead><tr><th>تیم</th><th>رتبه</th><th>بازی</th><th>برد</th><th>مساوی</th><th>باخت</th><th>گل زده</th><th>گل خورده</th><th>امتیاز</th></tr></thead><tbody>'+rows.map(r=>`<tr><td>${esc(r.team.name)}</td><td>${r.rank??'—'}</td><td>${r.all?.played??'—'}</td><td>${r.all?.win??'—'}</td><td>${r.all?.draw??'—'}</td><td>${r.all?.lose??'—'}</td><td>${r.all?.goals?.for??'—'}</td><td>${r.all?.goals?.against??'—'}</td><td><b>${r.points??'—'}</b></td></tr>`).join('')+'</tbody></table></div>';}}
+ $('standings').innerHTML=table||'<div class="help">جدول رقابت مستقیم در داده‌های سرویس در دسترس نبود. جدول لیگ‌های داخلی در صورت پوشش در بخش عوامل تکمیلی استفاده شده است.</div>';
+ if(injuries){const renderInj=(teamId)=>{const arr=injuries.filter(x=>x.team?.id===teamId);return arr.length?arr.map(x=>`<div class="player"><span>${esc(x.player?.name||'بازیکن نامشخص')}</span><small>${esc(x.player?.type||'وضعیت نامشخص')} · ${esc(x.player?.reason||'')}</small></div>`).join(''):'<div class="help">غایب ثبت‌شده‌ای دریافت نشد؛ این به معنی تأیید حضور همه بازیکنان نیست.</div>';};$('injuries').innerHTML=`<h3 style="font-size:13px">مصدومان و محرومان ثبت‌شده برای مسابقه</h3><div class="two-col"><div><b>${esc(H.team.name)}</b><div class="player-list">${renderInj(H.team.id)}</div></div><div><b>${esc(A.team.name)}</b><div class="player-list">${renderInj(A.team.id)}</div></div></div>`;}else $('injuries').innerHTML='<div class="help">اطلاعات غایبان برای این مسابقه دریافت نشد؛ داده ناموجود به معنی نبود مصدوم نیست.</div>';
+ if(lineups?.length){$('lineups').innerHTML='<h3 style="font-size:13px">ترکیب منتشرشده از منبع داده</h3><div class="two-col">'+lineups.map(l=>`<div class="team-box"><b>${esc(l.team?.name||'تیم')} · ${esc(l.formation||'سیستم نامشخص')}</b><div class="help">${(l.startXI||[]).map(x=>esc(x.player?.name)).join('، ')||'ترکیب در دسترس نیست'}</div></div>`).join('')+'</div>';}else $('lineups').innerHTML=match?'<div class="help">ترکیب رسمی هنوز از API دریافت نشده است. طبق مستندات ارائه‌دهنده، ترکیب‌ها معمولاً ۲۰ تا ۴۰ دقیقه پیش از شروع در رقابت‌های دارای پوشش منتشر می‌شوند.</div>':'<div class="help">به دلیل نبود مسابقه مستقیم، ترکیب رسمی قابل دریافت نیست.</div>';
+ const tableMapFor=(data,id)=>{const rows=tableRows(data),r=rows.find(x=>x.team?.id===id);return r?{rank:r.rank,points:r.points,played:r.all?.played,ppg:r.all?.played?(r.points/r.all.played):null,total:rows.length}:null;};
+ const rankH=tableMapFor(homeTable,modelHomeId),rankA=tableMapFor(awayTable,modelAwayId);const tier=r=>!r?'نامشخص':r.rank<=Math.ceil(r.total/3)?'یک‌سوم بالای جدول':r.rank>Math.floor(r.total*2/3)?'یک‌سوم پایین جدول':'بخش میانی جدول';
+ const restTxt=r=>r.days===null?'نامشخص':`${r.days} روز از بازی قبلی · ${r.in14} بازی در ۱۴ روز اخیر`;
+ const qualityTxt=q=>`${q.n} بازی وزن‌دهی‌شده · امتیاز مؤثر ${q.adjustedPPG.toFixed(2)} از ۳ · قدرت میانگین حریف ${q.avgOpponentPPG===null?'نامشخص':q.avgOpponentPPG.toFixed(2)+' امتیاز در هر بازی'}`;
+ const absenceHtml=(teamName,absence)=>{const effect=absence.available?`کاهش تخمینی توان حمله ${(absence.attackPenalty*100).toFixed(1)}٪ · افزایش ریسک دریافت گل ${(absence.defensePenalty*100).toFixed(1)}٪`:'اطلاعات غایبان از API در دسترس نبود؛ اثر آن در مدل اعمال نشده است.';const players=!absence.available?'<div class="help">گزارش غایبان قابل دریافت نبود؛ وضعیت بازیکنان نامشخص است.</div>':absence.players.length?absence.players.map(x=>`<div class="impact-item"><span>${esc(x.name)}<small> · ${esc(x.position)}</small></span><small>${esc(x.status)}${x.importance!==null?' · اهمیت '+Math.round(x.importance*100)+'٪':' · اهمیت قابل محاسبه نیست'}</small></div>`).join(''):'<div class="help">غایب ثبت‌شده‌ای دریافت نشد؛ فهرست کامل ممکن است در این لیگ پوشش داده نشود.</div>';return `<div class="factor"><b>${esc(teamName)} · اثر غایبان</b><span>${effect}</span><div class="impact-list" style="margin-top:7px">${players}</div><span class="help">بازیکنان وزن‌دار: ${absence.known} · بازیکنان با اهمیت نامشخص: ${absence.unknown}</span></div>`;};
+ const dataScore=pred.reliability;const grade=dataScore>=80?'خوب':dataScore>=60?'متوسط':'محدود';
+ const oddsHtml=market?`احتمال بازار بدون حاشیه سود: ${pct(market.home)} / ${pct(market.draw)} / ${pct(market.away)} (${market.books} مجموعه قیمت)`:'ضرایب معتبر ۱X۲ از سرویس در دسترس نبود.';
+ const providerHtml=pred.providerP?`مدل پیش‌بینی API-Football: ${pct(pred.providerP.home)} / ${pct(pred.providerP.draw)} / ${pct(pred.providerP.away)}`:'مدل پیش‌بینی API-Football در دسترس نبود.';
+ const goalContext=(teamSeason)=>teamSeason?`آمار فصل: ${teamSeason.played} بازی · ${teamSeason.gf===null?'—':teamSeason.gf.toFixed(2)} گل زده و ${teamSeason.ga===null?'—':teamSeason.ga.toFixed(2)} گل خورده در هر مسابقه`:'آمار فصلِ لیگ اصلی تیم دریافت نشد.';
+ $('advancedAnalysis').innerHTML=`<div class="factor-grid"><div class="factor"><b>کیفیت پوشش داده</b><span class="value">${dataScore}/100 · ${grade}</span><div class="meter"><i style="width:${dataScore}%"></i></div><span>این شاخص کامل‌بودن داده است، نه احتمال درست بودن پیش‌بینی.</span></div><div class="factor"><b>قدرت حریفان اخیر</b><span>${esc(modelHome.team.name)}: ${qualityTxt(homeQuality)}</span><br><span>${esc(modelAway.team.name)}: ${qualityTxt(awayQuality)}</span></div><div class="factor"><b>استراحت و فشردگی برنامه</b><span>${esc(modelHome.team.name)}: ${restTxt(homeRest)}</span><br><span>${esc(modelAway.team.name)}: ${restTxt(awayRest)}</span></div><div class="factor"><b>جدول و جایگاه لیگ</b><span>${esc(modelHome.team.name)}: ${rankH?`رتبه ${rankH.rank} از ${rankH.total} · ${rankH.points} امتیاز · ${rankH.ppg.toFixed(2)} امتیاز/بازی · ${tier(rankH)}`:'اطلاعات جدول نامشخص'}</span><br><span>${esc(modelAway.team.name)}: ${rankA?`رتبه ${rankA.rank} از ${rankA.total} · ${rankA.points} امتیاز · ${rankA.ppg.toFixed(2)} امتیاز/بازی · ${tier(rankA)}`:'اطلاعات جدول نامشخص'}</span><span class="help">جایگاه جدول شاخص زمینه‌ای است؛ انگیزه ذهنی یا هدف باشگاه را به‌تنهایی ثابت نمی‌کند.</span></div><div class="factor"><b>قدرت فصل · ${esc(modelHome.team.name)}</b><span>${goalContext(homeSeason)}</span></div><div class="factor"><b>قدرت فصل · ${esc(modelAway.team.name)}</b><span>${goalContext(awaySeason)}</span></div><div class="factor"><b>بازار پیش‌بینی</b><span>${oddsHtml}</span></div><div class="factor"><b>مدل مستقل ارائه‌دهنده</b><span>${providerHtml}</span></div><div class="factor"><b>کیفیت حریفان در برنامه اخیر</b><span>${esc(modelHome.team.name)}: ${homeQuality.opponentsRated} حریف دارای رتبه · ${esc(modelAway.team.name)}: ${awayQuality.opponentsRated} حریف دارای رتبه</span></div><div class="factor"><b>xG و تحلیل تاکتیکی</b><span>xG در این تحلیل از API دریافت نشد یا برای این رقابت قابل تأیید نبود. تحلیل تاکتیکی و خبرهای محلی نیز خودکار از این سرویس تأیید نمی‌شوند.</span></div></div><div class="two-col" style="margin-top:10px">${absenceHtml(modelHome.team.name,homeAbsence)}${absenceHtml(modelAway.team.name,awayAbsence)}</div><div class="notice" style="margin-top:10px"><b>وزن ترکیب نهایی مدل:</b> مدل داخلی ${Math.round(pred.weights.internal*100)}٪${pred.weights.provider?` · پیش‌بینی API ${Math.round(pred.weights.provider*100)}٪`:''}${pred.weights.market?` · بازار ${Math.round(pred.weights.market*100)}٪`:''}. غایبان، استراحت و فرم در محاسبه گل مورد انتظار وارد شده‌اند؛ جدول و شرایط انگیزشی فقط به‌عنوان زمینه گزارش شده‌اند.</div><div class="data-warning">اگر ترکیب رسمی هنوز منتشر نشده باشد، غایبِ نامشخص را غایب قطعی فرض نکن. وزن اثر بازیکن فقط وقتی محاسبه می‌شود که آمار فصل او در API موجود باشد.</div>`;
+ let notes=[];const ppgH=homeQuality.adjustedPPG,ppgA=awayQuality.adjustedPPG;
+ if(ppgH>ppgA+.35)notes.push(`${modelHome.team.name} در فرم اخیر، پس از تعدیل محدود قدرت حریفان، امتیازگیری بهتری داشته است.`);else if(ppgA>ppgH+.35)notes.push(`${modelAway.team.name} در فرم اخیر، پس از تعدیل محدود قدرت حریفان، امتیازگیری بهتری داشته است.`);else notes.push('فرم تعدیل‌شده دو تیم نزدیک است و برتری واضحی از این معیار دیده نمی‌شود.');
+ if(!homeAbsence.available||!awayAbsence.available)notes.push('فهرست غایبان برای یکی از تیم‌ها یا هر دو تیم از سرویس دریافت نشد؛ غیبت‌ها در مدل اعمال نشده‌اند.');else if(homeAbsence.total+awayAbsence.total)notes.push(`غایبان گزارش‌شده ${homeAbsence.total} نفر برای تیم اول و ${awayAbsence.total} نفر برای تیم دوم هستند؛ اثر آماری فقط برای بازیکنانی محاسبه می‌شود که آمار فصلشان در دسترس است.`);else notes.push('در endpoint غایبان، موردی برای این مسابقه ثبت نشده است؛ این به معنی تأیید قطعی حضور همه بازیکنان نیست.');
+ if(homeRest.days!==null&&awayRest.days!==null){if(homeRest.days<3&&awayRest.days>=5)notes.push(`${modelHome.team.name} نسبت به حریف زمان استراحت کمتری داشته است.`);else if(awayRest.days<3&&homeRest.days>=5)notes.push(`${modelAway.team.name} نسبت به حریف زمان استراحت کمتری داشته است.`);else notes.push(`فاصله استراحت دو تیم: ${homeRest.days} و ${awayRest.days} روز.`);}
+ if(hh.n>=5)notes.push(`در ${hh.n} رودرروی اخیر: ${hh.w} برد تیم اول، ${hh.d} مساوی و ${hh.l} برد تیم دوم؛ تأثیر رودررو در مدل محدود و حداکثر ۳.۵٪ است.`);else notes.push('نمونه رودررو کمتر از ۵ بازی است یا داده کافی وجود ندارد؛ بنابراین در درصدها وزن قابل‌توجهی نگرفته است.');
+ if(!match)notes.push('مسابقه مستقیم آینده شناسایی نشد؛ درصدها بر اساس فرض تیم اول به‌عنوان میزبان هستند و برای بازی مشخص قابل استفاده مستقیم نیستند.');
+ notes.push('انگیزه ذهنی، تغییرات تاکتیکی، شرایط آب‌وهوا و اخبار محلی از API-Football به‌طور کامل قابل اندازه‌گیری نیستند؛ در نسخه حاضر این موارد به‌عنوان داده قطعی وارد مدل نشده‌اند.');
+ $('analysisText').innerHTML=notes.map(n=>`<div class="callout">${esc(n)}</div>`).join('');
+ const h2hText=`${hh.n} بازی؛ برد تیم اول ${hh.w}، مساوی ${hh.d}، برد تیم دوم ${hh.l}؛ گل ${hh.gf}-${hh.ga}`;
+ latestReport=`آنالیز فوتبال نسخه ۲: ${modelHome.team.name} – ${modelAway.team.name}\n${match?`${f.league} | ${fmtDate(f.date)}`:'بازی مستقیم آینده پیدا نشد'}\nاحتمال برد میزبان ${pct(pred.home)} | مساوی ${pct(pred.draw)} | برد مهمان ${pct(pred.away)}\nگل مورد انتظار: ${pred.lambdaHome.toFixed(2)} - ${pred.lambdaAway.toFixed(2)}\nفرم و قدرت حریف ${modelHome.team.name}: ${qualityTxt(homeQuality)}\nفرم و قدرت حریف ${modelAway.team.name}: ${qualityTxt(awayQuality)}\nاستراحت: ${homeRest.days??'نامشخص'} روز و ${awayRest.days??'نامشخص'} روز\nاثر غایبان: ${modelHome.team.name} ${homeAbsence.available?homeAbsence.known+' وزن‌دار':'نامشخص'}، ${modelAway.team.name} ${awayAbsence.available?awayAbsence.known+' وزن‌دار':'نامشخص'}\nرودررو: ${h2hText}\nکیفیت پوشش داده: ${dataScore}/100\nاین تخمین آماری است، تضمین نتیجه نیست.`;
+ $('quotaInfo').textContent=`درخواست‌های واقعی این تحلیل: ${callCount}${quotaRemaining!==null?` · درخواست باقی‌مانده امروز: ${quotaRemaining} از ${quotaLimit||'—'}`:''} · پاسخ‌های cache‌شده دوباره از سهمیه API کم نمی‌شوند. داده xG/خبرهای محلی در صورت نبود پوشش نمایش داده نمی‌شود.`;
+}
+$('toggleKey').onclick=()=>{const i=$('apiKey');i.type=i.type==='password'?'text':'password';$('toggleKey').textContent=i.type==='password'?'نمایش':'پنهان'};
+$('apiKey').addEventListener('input',()=>{if($('rememberKey').checked)localStorage.setItem('footballAnalyzerKey',$('apiKey').value);});
+$('rememberKey').onchange=()=>{if($('rememberKey').checked){if($('apiKey').value.trim())localStorage.setItem('footballAnalyzerKey',$('apiKey').value.trim());}else localStorage.removeItem('footballAnalyzerKey');};
+const saved=localStorage.getItem('footballAnalyzerKey');if(saved){$('apiKey').value=saved;$('rememberKey').checked=true;}
+$('searchBtn').onclick=searchTeams;$('analyzeBtn').onclick=analyze;
+$('copyReport').onclick=async()=>{try{await navigator.clipboard.writeText(latestReport);setStatus('خلاصه تحلیل کپی شد.');}catch(e){setStatus('کپی خودکار در این مرورگر فعال نیست.','error');}};
+$('newAnalysis').onclick=()=>{$('report').classList.add('hidden');$('homeQuery').focus();window.scrollTo({top:0,behavior:'smooth'});};
+$('clearCache').onclick=()=>{apiCache.clear();setStatus('حافظه موقت داده‌ها پاک شد. تحلیل بعدی درخواست تازه به API می‌فرستد.');};
+if('serviceWorker' in navigator && location.protocol==='https:'){window.addEventListener('load',()=>navigator.serviceWorker.register('./sw.js').catch(()=>{}));}
+</script>
+</body>
+</html>
+.min(25,Math.min(homeStats.all.n,awayStats.all.n)*1.25),season:(homeSeason&&awaySeason)?15:0,table:(homeQuality.opponentsRated>2&&awayQuality.opponentsRated>2)?15:5,injuries:(homeAbsence.available&&awayAbsence.available)?10:0,fixture:fixture?10:0,external:(providerP||market)?10:0,venue:(homeStats.home.n>=3&&awayStats.away.n>=3)?15:5};
+ const reliability=Math.round(Object.values(reliabilityParts).reduce((x,y)=>x+y,0));
+ return {...raw,...prob,providerP,marketP:market,weights:mixed.weights,lambdaHome:lh,lambdaAway:la,formDelta,h2hWeight:h2hAdjusted.home!==raw.home,rawPoisson:raw,reliability:Math.min(100,reliability),reliabilityParts};
+}
+function pct(x){return Math.round(x*100)+'٪';}
+function formHtml(arr){if(!arr.length)return '<span class="muted">داده موجود نیست</span>';return '<div class="form">'+arr.map(x=>`<i class="${x}">${x==='W'?'ب':x==='D'?'م':'ش'}</i>`).join('')+'</div>';}
+function statPanel(team,st,form){const name=esc(team.team.name),logo=team.team.logo||'';const a=st.all;return `<div class="team-box"><div class="team-head">${logo?`<img src="${esc(logo)}" alt="">`:''}<div><div class="team-name">${name}</div><div class="team-meta">${esc(team.team.country||'')}</div></div></div><div class="sub" style="margin-bottom:5px">فرم ۵ بازی آخر</div>${formHtml(form)}<div class="metrics" style="grid-template-columns:repeat(3,1fr);margin-top:10px"><div class="metric"><b>${a.w}</b><span>برد</span></div><div class="metric"><b>${a.d}</b><span>مساوی</span></div><div class="metric"><b>${a.l}</b><span>باخت</span></div><div class="metric"><b>${a.gf}</b><span>گل زده</span></div><div class="metric"><b>${a.ga}</b><span>گل خورده</span></div><div class="metric"><b>${a.gd>0?'+':''}${a.gd}</b><span>تفاضل گل</span></div></div><div class="sub" style="margin-top:10px">خانه: ${st.home.n} بازی، ${st.home.w} برد، ${st.home.d} مساوی، ${st.home.l} باخت</div><div class="sub">خارج: ${st.away.n} بازی، ${st.away.w} برد، ${st.away.d} مساوی، ${st.away.l} باخت</div></div>`;}
+function matchesHtml(fixtures,team1,team2){if(!fixtures?.length)return '<div class="help">بازی ثبت‌شده‌ای در این بخش پیدا نشد.</div>';return fixtures.slice(0,10).map(f=>{const h=f.teams.home,a=f.teams.away;const sc=isDone(f)?`${f.goals.home} – ${f.goals.away}`:'در انتظار';return `<div class="match-item"><div><div>${esc(h.name)} – ${esc(a.name)}</div><div class="date">${fmtDate(f.fixture.date)} · ${esc(f.league?.name||'')}</div></div><div class="score">${sc}</div></div>`}).join('');}
+function h2hStats(fixtures,homeId){let w=0,d=0,l=0,gf=0,ga=0;const done=(fixtures||[]).filter(isDone);done.forEach(f=>{const h=f.teams.home.id===homeId;const x=num(h?f.goals.home:f.goals.away),y=num(h?f.goals.away:f.goals.home);gf+=x;ga+=y;if(x>y)w++;else if(x===y)d++;else l++;});return {n:done.length,w,d,l,gf,ga,gd:gf-ga,done};}
+function standingsRows(data,homeId,awayId){const groups=data?.response?.[0]?.league?.standings||[];const rows=groups.flat();return rows.filter(r=>r.team?.id===homeId||r.team?.id===awayId);}
 async function analyze(){
  if(!selectedHome||!selectedAway){setStatus('ابتدا جست‌وجوی دو تیم را انجام بده.','error');return;}
  $('analyzeBtn').disabled=true;$('report').classList.add('hidden');setStatus('در حال دریافت فرم، قدرت حریفان، آمار فصل، غایبان و وضعیت مسابقه...','busy');callCount=0;quotaRemaining=null;quotaLimit=null;
@@ -319,8 +452,6 @@ const saved=localStorage.getItem('footballAnalyzerKey');if(saved){$('apiKey').va
 $('searchBtn').onclick=searchTeams;$('analyzeBtn').onclick=analyze;
 $('copyReport').onclick=async()=>{try{await navigator.clipboard.writeText(latestReport);setStatus('خلاصه تحلیل کپی شد.');}catch(e){setStatus('کپی خودکار در این مرورگر فعال نیست.','error');}};
 $('newAnalysis').onclick=()=>{$('report').classList.add('hidden');$('homeQuery').focus();window.scrollTo({top:0,behavior:'smooth'});};
-$('clearCache').onclick=()=>{apiCache.clear();setStatus('حافظه موقت داده‌ها پاک شد. تحلیل بعدی درخواست تازه به API می‌فرستد.');};
-if('serviceWorker' in navigator && location.protocol==='https:'){window.addEventListener('load',()=>navigator.serviceWorker.register('./sw.js').catch(()=>{}));}
-</script>
+$('clearCache').onclick=()=>{apiCache.clear();setStatus('حافظه موقت داده‌ها پاک شد. تحلیل بعدی د
 </body>
 </html>
